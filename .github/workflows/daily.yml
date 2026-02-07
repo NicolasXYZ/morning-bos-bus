@@ -1,4 +1,4 @@
-name: Daily Flight Check
+name: Morning Bus
 
 on:
   schedule:
