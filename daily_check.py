@@ -70,4 +70,95 @@ def check_m2_shuttle():
     """
     Scrapes Longwood Collective website for M2 alerts.
     """
-    print
+    print("Checking M2 Shuttle...")
+    try:
+        # Fake a browser user-agent to avoid being blocked
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(M2_URL, headers=headers)
+        
+        if response.status_code != 200:
+            return "⚠️ Could not access Longwood Collective website."
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Get all text from the page body (limit to 6000 chars for AI)
+        page_text = soup.get_text()[:6000] 
+        
+        return get_m2_summary(page_text)
+    except Exception as e:
+        return f"Error checking M2: {e}"
+
+# --- THE MISSING PART IS BELOW ---
+
+def send_email(subject, body):
+    print("--- PREPARING EMAIL ---")
+    
+    # 1. Validation to prevent crashes if secrets are missing
+    if not os.environ.get('EMAIL_USER') or not os.environ.get('EMAIL_PASSWORD'):
+        print("❌ ERROR: Email secrets are missing. Cannot send.")
+        return
+
+    sender = os.environ['EMAIL_USER']
+    password = os.environ['EMAIL_PASSWORD']
+    
+    # 2. Handle multiple recipients (split by comma)
+    raw_to = os.environ.get('EMAIL_TO', sender) # Default to self if missing
+    if ',' in raw_to:
+        receivers = [e.strip() for e in raw_to.split(',')]
+    else:
+        receivers = [raw_to]
+
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = ", ".join(receivers) # This is just the visual header
+
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(sender, password)
+            server.sendmail(sender, receivers, msg.as_string()) # This actually sends it
+        print(f"✅ Email successfully sent to {len(receivers)} recipient(s)!")
+    except Exception as e:
+        print(f"❌ Email failed: {e}")
+
+if __name__ == "__main__":
+    # 1. Gather Intelligence
+    mbta_status = check_mbta()
+    m2_status = check_m2_shuttle()
+
+    # 2. Determine Subject Line (The "Smart" Part)
+    today = datetime.now().strftime("%a, %b %d")
+    
+    # Check if strings contain "Normal" or "No ... advisories"
+    mbta_bad = "ISSUES FOUND" in mbta_status
+    m2_bad = "No M2 shuttle advisories" not in m2_status
+
+    if not mbta_bad and not m2_bad:
+        subject = f"✅ Commute Clear: All Normal ({today})"
+    elif mbta_bad and m2_bad:
+        subject = f"⚠️ Commute Alert: Issues on M2 AND MBTA ({today})"
+    elif mbta_bad:
+        # Extract just the header of the first MBTA issue for the subject
+        # e.g., "⚠️ Commute Alert: Red Line Delay..."
+        first_issue = mbta_status.split('\n')[1].replace('⚠️ ', '')[:30] 
+        subject = f"⚠️ Commute Alert: MBTA {first_issue}... ({today})"
+    elif m2_bad:
+        subject = f"⚠️ Commute Alert: M2 Shuttle Issues ({today})"
+
+    # 3. Construct Report
+    email_body = f"""
+    COMMUTE BRIEFING - {today}
+    
+    -------------------------------------------
+    🚌 HARVARD M2 SHUTTLE
+    {m2_status}
+    
+    -------------------------------------------
+    🚇 MBTA (Red Line & Bus 1)
+    {mbta_status}
+    
+    -------------------------------------------
+    """
+
+    print(f"Subject: {subject}")
+    send_email(subject, email_body)
