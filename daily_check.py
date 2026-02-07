@@ -28,7 +28,7 @@ def get_m2_summary(text_data):
         RULES:
         1. If there are delays, snow routes, or holiday schedule changes for M2, summarize them clearly.
         2. If the text mentions other shuttles (Fenway, Landmark) but NOT M2, ignore them.
-        3. If there is no relevant M2 news, reply exactly: "✅ No M2 shuttle advisories found."
+        3. If there is no relevant M2 news, reply exactly: "✅ Service Normal"
         
         DATA:
         {text_data}
@@ -42,29 +42,66 @@ def get_m2_summary(text_data):
     except Exception as e:
         return f"⚠️ Error asking AI about M2: {e}"
 
-def check_mbta():
+def check_mbta_split():
     """
-    Checks official MBTA API for Red Line and Bus 1.
+    Checks MBTA and separates Red Line vs Bus 1 updates.
+    Returns two strings: (red_status, bus_status)
     """
     print("Checking MBTA...")
     try:
         response = requests.get(MBTA_API_URL)
         alerts = response.json().get('data', [])
         
-        relevant_alerts = []
+        red_alerts = []
+        bus_alerts = []
+        
+        # KEY LOCATIONS: We only care about Red Line if it hits these
+        target_zone = ["Kendall", "MIT", "Central", "Harvard"]
+
         for alert in alerts:
             attrs = alert['attributes']
-            # Filter for meaningful disruptions only
+            
+            # 1. Filter: Only look at significant issues
             if attrs['effect'] in ['DELAY', 'SUSPENSION', 'DETOUR', 'SNOW_ROUTE', 'SHUTTLE']:
+                
                 header = attrs['header']
                 description = attrs['description']
-                relevant_alerts.append(f"⚠️ {header}\nDetails: {description}")
-        
-        if not relevant_alerts:
-            return "✅ MBTA (Red Line & Bus 1): Running normally."
-        return "🚨 **MBTA ISSUES FOUND:**\n" + "\n\n".join(relevant_alerts)
+                
+                # Check which route this alert belongs to
+                # The API returns a list of informed entities; we check the first one
+                informed = alert['attributes'].get('informed_entity', [{}])
+                route_id = informed[0].get('route_id') if informed else None
+
+                # 2. Logic for Red Line (Kendall <-> Harvard Filter)
+                if route_id == "Red":
+                    # Check if the text mentions our stations OR "all" (global delay)
+                    text_to_check = (header + description).lower()
+                    affects_my_commute = any(stop.lower() in text_to_check for stop in target_zone)
+                    is_global = "all" in text_to_check or "global" in text_to_check
+
+                    if affects_my_commute or is_global:
+                        red_alerts.append(f"⚠️ {header}")
+
+                # 3. Logic for Bus 1 (Always report)
+                elif route_id == "1":
+                    bus_alerts.append(f"⚠️ {header}")
+
+        # Construct Status Strings
+        if not red_alerts:
+            red_status = "✅ Service Normal (Kendall <-> Harvard)"
+        else:
+            red_status = "🚨 **RED LINE ISSUES:**\n" + "\n".join(red_alerts)
+
+        if not bus_alerts:
+            bus_status = "✅ Service Normal"
+        else:
+            bus_status = "🚨 **BUS 1 ISSUES:**\n" + "\n".join(bus_alerts)
+            
+        return red_status, bus_status
+
     except Exception as e:
-        return f"Error checking MBTA: {e}"
+        error_msg = f"Error checking MBTA: {e}"
+        return error_msg, error_msg
 
 def check_m2_shuttle():
     """
@@ -72,7 +109,6 @@ def check_m2_shuttle():
     """
     print("Checking M2 Shuttle...")
     try:
-        # Fake a browser user-agent to avoid being blocked
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(M2_URL, headers=headers)
         
@@ -80,29 +116,16 @@ def check_m2_shuttle():
             return "⚠️ Could not access Longwood Collective website."
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Get all text from the page body (limit to 6000 chars for AI)
         page_text = soup.get_text()[:6000] 
-        
         return get_m2_summary(page_text)
     except Exception as e:
         return f"Error checking M2: {e}"
 
-# --- THE MISSING PART IS BELOW ---
-
 def send_email(subject, body):
-    print("--- PREPARING EMAIL ---")
-    
-    # 1. Validation to prevent crashes if secrets are missing
-    if not os.environ.get('EMAIL_USER') or not os.environ.get('EMAIL_PASSWORD'):
-        print("❌ ERROR: Email secrets are missing. Cannot send.")
-        return
-
     sender = os.environ['EMAIL_USER']
     password = os.environ['EMAIL_PASSWORD']
     
-    # 2. Handle multiple recipients (split by comma)
-    raw_to = os.environ.get('EMAIL_TO', sender) # Default to self if missing
+    raw_to = os.environ.get('EMAIL_TO', sender)
     if ',' in raw_to:
         receivers = [e.strip() for e in raw_to.split(',')]
     else:
@@ -111,54 +134,60 @@ def send_email(subject, body):
     msg = MIMEText(body)
     msg['Subject'] = subject
     msg['From'] = sender
-    msg['To'] = ", ".join(receivers) # This is just the visual header
+    msg['To'] = ", ".join(receivers)
 
     try:
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(sender, password)
-            server.sendmail(sender, receivers, msg.as_string()) # This actually sends it
-        print(f"✅ Email successfully sent to {len(receivers)} recipient(s)!")
+            server.sendmail(sender, receivers, msg.as_string())
+        print(f"✅ Email sent to {len(receivers)} recipient(s)!")
     except Exception as e:
         print(f"❌ Email failed: {e}")
 
 if __name__ == "__main__":
     # 1. Gather Intelligence
-    mbta_status = check_mbta()
+    red_status, bus_status = check_mbta_split()
     m2_status = check_m2_shuttle()
 
-    # 2. Determine Subject Line (The "Smart" Part)
+    # 2. Determine Subject Line (Smart Logic)
     today = datetime.now().strftime("%a, %b %d")
     
-    # Check if strings contain "Normal" or "No ... advisories"
-    mbta_bad = "ISSUES FOUND" in mbta_status
-    m2_bad = "No M2 shuttle advisories" not in m2_status
+    # Define "Bad News" conditions
+    red_bad = "ISSUES" in red_status
+    bus_bad = "ISSUES" in bus_status
+    m2_bad = "Service Normal" not in m2_status
 
-    if not mbta_bad and not m2_bad:
+    if not red_bad and not bus_bad and not m2_bad:
         subject = f"✅ Commute Clear: All Normal ({today})"
-    elif mbta_bad and m2_bad:
-        subject = f"⚠️ Commute Alert: Issues on M2 AND MBTA ({today})"
-    elif mbta_bad:
-        # Extract just the header of the first MBTA issue for the subject
-        # e.g., "⚠️ Commute Alert: Red Line Delay..."
-        first_issue = mbta_status.split('\n')[1].replace('⚠️ ', '')[:30] 
-        subject = f"⚠️ Commute Alert: MBTA {first_issue}... ({today})"
+    elif red_bad:
+        # Prioritize Red Line in subject because it's the most critical
+        subject = f"⚠️ Commute Alert: Red Line Issues ({today})"
+    elif bus_bad:
+        subject = f"⚠️ Commute Alert: Bus 1 Issues ({today})"
     elif m2_bad:
         subject = f"⚠️ Commute Alert: M2 Shuttle Issues ({today})"
+    else:
+        subject = f"⚠️ Commute Update ({today})"
 
     # 3. Construct Report
     email_body = f"""
     COMMUTE BRIEFING - {today}
     
     -------------------------------------------
-    🚌 HARVARD M2 SHUTTLE
-    {m2_status}
+    🚇 RED LINE (Subway)
+    {red_status}
     
     -------------------------------------------
-    🚇 MBTA (Red Line & Bus 1)
-    {mbta_status}
+    🚌 BUS 1 (Backup)
+    {bus_status}
+
+    -------------------------------------------
+    🚐 HARVARD M2 SHUTTLE
+    {m2_status}
     
     -------------------------------------------
     """
 
     print(f"Subject: {subject}")
+    print(email_body)
     send_email(subject, email_body)
